@@ -88,6 +88,17 @@ button, input, textarea, select { font: inherit; }
 .impact-list strong, .impact-list small { display: block; }
 .impact-list strong { font-size: 10px; }
 .impact-list small { margin-top: 2px; color: #7c8796; font-size: 9px; }
+.impact-record-list { display: grid; gap: 10px; max-height: 300px; overflow-y: auto; }
+.impact-record-list article { padding: 11px 12px; border: 1px solid #e2e7ed; border-radius: 8px; background: #f9fafb; }
+.impact-record-list article.open { border-color: #f0c98a; background: #fffaf0; }
+.impact-record-list article.resolved { opacity: .72; }
+.impact-record-list header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.impact-record-list header strong { font-size: 11px; }
+.impact-record-list article > .muted { margin: 4px 0 7px; font-size: 9px; }
+.field-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 7px; }
+.field-tags .bp6-tag { font-size: 9px; }
+.affected-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 9px; color: #7c8796; }
+.affected-steps .bp6-tag { cursor: pointer; font-size: 9px; }
 .safety-row { width: 100%; padding: 10px 2px; display: grid; grid-template-columns: 18px 1fr; gap: 7px; border: 0; border-bottom: 1px solid #e7ebf0; text-align: left; background: transparent; cursor: pointer; }
 .safety-row strong, .safety-row small { display: block; }
 .safety-row strong { font-size: 10px; }

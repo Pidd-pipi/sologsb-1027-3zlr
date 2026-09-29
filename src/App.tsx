@@ -57,6 +57,17 @@ interface VersionSnapshot {
   steps: ProcessStep[];
 }
 
+interface ReviewImpactRecord {
+  id: string;
+  triggerStepId: string;
+  triggerStepTitle: string;
+  affectedStepIds: string[];
+  changedFields: string[];
+  createdAt: string;
+  resolved: boolean;
+  resolvedAt?: string;
+}
+
 interface ExperimentProcess {
   id: string;
   title: string;
@@ -68,6 +79,8 @@ interface ExperimentProcess {
   version: string;
   steps: ProcessStep[];
   versions: VersionSnapshot[];
+  impactRecords: ReviewImpactRecord[];
+  legacyData?: boolean;
   frozenAt?: string;
   updatedAt: string;
 }
@@ -160,7 +173,8 @@ function initialProcess(): ExperimentProcess {
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, versions: [firstVersion, secondVersion], impactRecords: [],
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -194,10 +208,35 @@ function loadProcess(): ExperimentProcess {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
     const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    if (!parsed.id || !Array.isArray(parsed.steps)) return initialProcess();
+    if (!Array.isArray(parsed.impactRecords)) return migrateLegacyData(parsed);
+    return parsed;
   } catch {
     return initialProcess();
   }
+}
+
+function migrateLegacyData(parsed: ExperimentProcess): ExperimentProcess {
+  const confirmed = parsed.steps.filter((step) => step.status === 'confirmed');
+  const impactRecords: ReviewImpactRecord[] = [];
+  if (confirmed.length) {
+    impactRecords.push({
+      id: uid('impact'),
+      triggerStepId: '',
+      triggerStepTitle: '历史数据迁移（缺少确认记录）',
+      affectedStepIds: confirmed.map((step) => step.id),
+      changedFields: ['确认来源不明'],
+      createdAt: new Date().toISOString(),
+      resolved: false
+    });
+    confirmed.forEach((step) => { step.status = 'submitted'; });
+  }
+  return {
+    ...parsed,
+    impactRecords,
+    legacyData: true,
+    status: parsed.status === 'frozen' ? 'in-review' : parsed.status
+  };
 }
 
 function splitList(value: string): string[] {
@@ -235,6 +274,14 @@ function App() {
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
   const downstreamIds = useMemo(() => collectDownstream(process.steps, lastModifiedId), [process.steps, lastModifiedId]);
   const impactedSteps = process.steps.filter((step) => downstreamIds.includes(step.id));
+  const reReviewStepIds = useMemo(() => {
+    const ids = new Set<string>();
+    process.impactRecords.forEach((record) => {
+      if (!record.resolved) record.affectedStepIds.forEach((id) => ids.add(id));
+    });
+    return ids;
+  }, [process.impactRecords]);
+  const openImpactCount = process.impactRecords.filter((record) => !record.resolved).length;
   const missingSafetySteps = process.steps.filter(hasMissingSafety);
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
@@ -295,7 +342,11 @@ function App() {
     setLastModifiedId(id);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      const before = clone(step);
+      (step as unknown as Record<string, unknown>)[field] = value;
+      const changedFields = diffStepFields(before, step);
+      applyReReviewImpact(draft, id, changedFields);
     });
   };
 
@@ -337,9 +388,26 @@ function App() {
   const deleteStep = (): void => {
     if (!selectedStep || process.steps.length <= 1 || process.status === 'frozen') return;
     const id = selectedStep.id;
+    const title = selectedStep.title;
     commitProcess((draft) => {
+      const downstream = collectDownstream(draft.steps, id);
       draft.steps = draft.steps.filter((step) => step.id !== id);
       draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
+      const toKnock = draft.steps.filter((step) => downstream.includes(step.id) && step.status === 'confirmed');
+      if (toKnock.length) {
+        const affectedStepIds = toKnock.map((step) => step.id);
+        toKnock.forEach((step) => { step.status = 'submitted'; });
+        draft.impactRecords.push({
+          id: uid('impact'),
+          triggerStepId: id,
+          triggerStepTitle: `${title}（已删除）`,
+          affectedStepIds,
+          changedFields: ['依赖关系'],
+          createdAt: new Date().toISOString(),
+          resolved: false
+        });
+      }
+      resolveImpactRecords(draft);
     });
     setSelectedStepId(process.steps.find((step) => step.id !== id)?.id ?? '');
   };
@@ -392,8 +460,17 @@ function App() {
 
   const setStepStatus = (status: StepStatus): void => {
     if (!selectedStep) return;
-    updateStep('status', status);
-    setLastModifiedId(status === 'returned' ? selectedStep.id : null);
+    const id = selectedStep.id;
+    if (status === 'confirmed' && hasUnresolvedComments(selectedStep)) {
+      setSavedLabel('存在未解决批注，解决后才能重新确认');
+      return;
+    }
+    commitProcess((draft) => {
+      const step = draft.steps.find((item) => item.id === id);
+      if (step) step.status = status;
+      if (status === 'confirmed') resolveImpactRecords(draft);
+    });
+    setLastModifiedId(status === 'returned' ? id : null);
   };
 
   const resolveComment = (commentId: string): void => {
@@ -407,7 +484,7 @@ function App() {
 
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
+    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length || process.steps.some(hasUnresolvedComments)) {
       setSavedLabel('冻结条件未满足');
       return;
     }
@@ -477,6 +554,11 @@ function App() {
       </header>
 
       {!online && <Callout className="offline-callout" intent="warning" icon="cloud">网络不可用。编辑、复核和版本快照仍会保存在当前浏览器。</Callout>}
+      {process.legacyData && (
+        <Callout className="offline-callout" intent="warning" icon="history">
+          检测到浏览器中保存的是旧版数据，缺少确认记录。{process.impactRecords.find((record) => !record.resolved)?.affectedStepIds.length ?? 0} 条历史确认来源不明，已回到待复核，请逐条重新确认后才能冻结。
+        </Callout>
+      )}
 
       <section className="process-banner">
         <div className="banner-main">
@@ -513,8 +595,12 @@ function App() {
               {process.steps.map((step, index) => (
                 <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
                   <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
-                  {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
+                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}{reReviewStepIds.has(step.id) ? ' · 需重新复核' : ''}</small></span>
+                  {hasMissingSafety(step)
+                    ? <Icon icon="warning-sign" intent="danger" size={13} />
+                    : reReviewStepIds.has(step.id)
+                      ? <Icon icon="history" intent="warning" size={13} />
+                      : null}
                 </button>
               ))}
             </div>
@@ -549,7 +635,7 @@ function App() {
                 <FormGroup label="材料" labelFor="materials"><TextArea id="materials" fill value={selectedStep.materials} onChange={(event) => updateStep('materials', event.target.value)} /></FormGroup>
                 <FormGroup label="设备" labelFor="equipment"><TextArea id="equipment" fill value={selectedStep.equipment} onChange={(event) => updateStep('equipment', event.target.value)} /></FormGroup>
                 <FormGroup label="用量 / 参数" labelFor="amount"><TextArea id="amount" fill value={selectedStep.amount} onChange={(event) => updateStep('amount', event.target.value)} /></FormGroup>
-                <FormGroup label="预计时间（分钟）" labelFor="duration"><InputGroup id="duration" type="number" min={1} fill value={String(selectedStep.duration)} onChange={(event) => updateStep('duration', Number(event.target.value))} /></FormGroup>
+                <FormGroup label="预计时间（分钟）" labelFor="duration"><InputGroup id="duration" type="number" min={1} fill value={String(selectedStep.duration)} onChange={(event) => updateStep('duration', Number.isNaN(Number(event.target.value)) ? 0 : Number(event.target.value))} /></FormGroup>
               </div>
               <div className="form-grid two-column">
                 <FormGroup label="危险项（逗号或换行分隔）" labelFor="hazards"><TextArea id="hazards" fill value={selectedStep.hazards.join('，')} onChange={(event) => updateStepList('hazards', event.target.value)} /></FormGroup>
@@ -594,6 +680,36 @@ function App() {
               ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤和已确认内容。</p>}
             </Card>
 
+            <Card elevation={Elevation.ONE} className="impact-records-card">
+              <div className="card-title"><div><span>RE-REVIEW RECORDS</span><h3>重新复核记录</h3></div><Tag minimal intent={openImpactCount ? 'warning' : 'success'}>{openImpactCount ? `${openImpactCount} 条待处理` : '已闭环'}</Tag></div>
+              {process.impactRecords.length ? (
+                <div className="impact-record-list">
+                  {process.impactRecords.map((record) => (
+                    <article key={record.id} className={record.resolved ? 'resolved' : 'open'}>
+                      <header>
+                        <strong>{record.triggerStepTitle}</strong>
+                        <Tag minimal intent={record.resolved ? 'success' : 'warning'}>{record.resolved ? '已重新确认' : '待重新复核'}</Tag>
+                      </header>
+                      <p className="muted">{formatDate(record.createdAt)} · 触发步骤</p>
+                      <div className="field-tags">{record.changedFields.map((field) => <Tag key={field} minimal>{field}</Tag>)}</div>
+                      <div className="affected-steps">
+                        <span>波及</span>
+                        {record.affectedStepIds.map((id) => {
+                          const affected = process.steps.find((step) => step.id === id);
+                          if (!affected) return null;
+                          return (
+                            <Tag key={id} minimal intent={affected.status === 'confirmed' ? 'success' : 'warning'} onClick={() => setSelectedStepId(id)}>
+                              {affected.title}
+                            </Tag>
+                          );
+                        })}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : <p className="muted">修改已确认步骤的条件或依赖后，这里会记录触发步骤、波及范围和变化字段，受影响步骤需重新确认。</p>}
+            </Card>
+
             <Card elevation={Elevation.ONE} className="safety-card">
               <div className="card-title"><div><span>SAFETY GATE</span><h3>安全完整性</h3></div><Tag intent={missingSafetySteps.length ? 'danger' : 'success'} minimal>{missingSafetySteps.length ? `${missingSafetySteps.length} 项缺口` : '通过'}</Tag></div>
               {missingSafetySteps.length ? missingSafetySteps.map((step) => (
@@ -619,7 +735,7 @@ function App() {
             <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={pendingReviewCount ? 'warning' : 'success'}>{pendingReviewCount ? `${pendingReviewCount} 待处理` : '已完成'}</Tag></div>
             {process.steps.map((step, index) => (
               <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
-                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
+                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}{reReviewStepIds.has(step.id) ? ' · 需重新复核' : ''}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : reReviewStepIds.has(step.id) ? 'history' : step.status === 'returned' ? 'undo' : 'circle'} intent={reReviewStepIds.has(step.id) ? 'warning' : 'none'} size={15} />
               </button>
             ))}
           </aside>
@@ -636,6 +752,15 @@ function App() {
                   <div className="review-section"><h4>控制措施</h4><p>{selectedStep.controls || '未填写'}</p></div>
                   <div className="review-section"><h4>安全说明</h4><p className={hasMissingSafety(selectedStep) ? 'danger-text' : ''}>{selectedStep.safetyNote || '未填写'}</p></div>
                   {hasMissingSafety(selectedStep) && <Callout intent="danger" icon="warning-sign">当前步骤存在安全信息缺口，不能确认或冻结版本。</Callout>}
+                  {reReviewStepIds.has(selectedStep.id) && (() => {
+                    const record = process.impactRecords.find((item) => !item.resolved && item.affectedStepIds.includes(selectedStep.id));
+                    if (!record) return null;
+                    return (
+                      <Callout intent="warning" icon="history">
+                        该步骤因「{record.triggerStepTitle}」变化回到待复核（变化字段：{record.changedFields.join('、')}），请重新核对并确认。
+                      </Callout>
+                    );
+                  })()}
                 </Card>
                 <Card elevation={Elevation.ONE} className="comment-card">
                   <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{selectedStep.comments.length} 条</Tag></div>
@@ -659,8 +784,11 @@ function App() {
           <aside className="review-actions">
             <Card elevation={Elevation.ONE}>
               <div className="card-title"><div><span>REVIEWER ACTION</span><h3>复核决定</h3></div><Icon icon="endorsed" size={18} /></div>
-              <p className="muted">确认后若修改该步骤，受影响的下游步骤会在编辑页重新提示。</p>
-              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep)} onClick={() => setStepStatus('confirmed')} />
+              <p className="muted">确认后若修改该步骤，受影响的下游步骤会回到待复核并记录触发步骤、波及范围与变化字段。</p>
+              {hasUnresolvedComments(selectedStep) && (
+                <Callout intent="warning" icon="comment">该步骤有 {selectedStep.comments.filter((comment) => !comment.resolved).length} 条未解决批注，解决后才能重新确认。</Callout>
+              )}
+              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep) || hasUnresolvedComments(selectedStep)} onClick={() => setStepStatus('confirmed')} />
               <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
               <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
               <Divider />
@@ -731,6 +859,85 @@ function collectDownstream(steps: ProcessStep[], sourceId: string | null): strin
   };
   visit(sourceId);
   return [...result];
+}
+
+const STEP_FIELD_LABELS: Record<string, string> = {
+  title: '名称',
+  purpose: '目的',
+  materials: '材料',
+  equipment: '设备',
+  amount: '用量',
+  duration: '预计时间',
+  hazards: '危险项',
+  controls: '控制措施',
+  safetyNote: '安全说明',
+  expectedResult: '预期结果',
+  dependencies: '依赖关系'
+};
+
+function diffStepFields(before: ProcessStep, after: ProcessStep): string[] {
+  const fields: string[] = [];
+  Object.keys(STEP_FIELD_LABELS).forEach((key) => {
+    const beforeValue = (before as unknown as Record<string, unknown>)[key];
+    const afterValue = (after as unknown as Record<string, unknown>)[key];
+    const changed = Array.isArray(beforeValue)
+      ? JSON.stringify(beforeValue) !== JSON.stringify(afterValue)
+      : beforeValue !== afterValue;
+    if (changed) fields.push(STEP_FIELD_LABELS[key]);
+  });
+  return fields;
+}
+
+function hasUnresolvedComments(step: ProcessStep | undefined): boolean {
+  return !!step && step.comments.some((comment) => !comment.resolved);
+}
+
+function mergeFields(target: string[], incoming: string[]): string[] {
+  const result = [...target];
+  incoming.forEach((field) => { if (!result.includes(field)) result.push(field); });
+  return result;
+}
+
+function applyReReviewImpact(draft: ExperimentProcess, triggerId: string, changedFields: string[]): void {
+  if (!changedFields.length) return;
+  const trigger = draft.steps.find((step) => step.id === triggerId);
+  if (!trigger) return;
+  const scopeIds = [triggerId, ...collectDownstream(draft.steps, triggerId)];
+  const toKnock = draft.steps.filter((step) => scopeIds.includes(step.id) && step.status === 'confirmed');
+  const existing = draft.impactRecords.find((record) => record.triggerStepId === triggerId && !record.resolved);
+  if (toKnock.length) {
+    const affectedStepIds = toKnock.map((step) => step.id);
+    toKnock.forEach((step) => { step.status = 'submitted'; });
+    if (existing) {
+      existing.affectedStepIds = [...new Set([...existing.affectedStepIds, ...affectedStepIds])];
+      existing.changedFields = mergeFields(existing.changedFields, changedFields);
+      existing.triggerStepTitle = trigger.title;
+    } else {
+      draft.impactRecords.push({
+        id: uid('impact'),
+        triggerStepId: triggerId,
+        triggerStepTitle: trigger.title,
+        affectedStepIds,
+        changedFields,
+        createdAt: new Date().toISOString(),
+        resolved: false
+      });
+    }
+  } else if (existing) {
+    existing.changedFields = mergeFields(existing.changedFields, changedFields);
+    existing.triggerStepTitle = trigger.title;
+  }
+}
+
+function resolveImpactRecords(draft: ExperimentProcess): void {
+  draft.impactRecords.forEach((record) => {
+    if (record.resolved) return;
+    const stillPresent = record.affectedStepIds.filter((id) => draft.steps.some((step) => step.id === id));
+    if (stillPresent.length && stillPresent.every((id) => draft.steps.find((step) => step.id === id)?.status === 'confirmed')) {
+      record.resolved = true;
+      record.resolvedAt = new Date().toISOString();
+    }
+  });
 }
 
 function nextMinorVersion(value: string): string {
