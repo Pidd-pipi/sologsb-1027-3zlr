@@ -70,7 +70,7 @@ button, input, textarea, select { font: inherit; }
 .step-actions { padding: 9px; display: flex; justify-content: center; border-top: 1px solid #e6eaf0; background: #f8fafb; }
 .editor-main { min-width: 0; display: grid; gap: 14px; }
 .bp6-card { margin: 0; }
-.process-meta-card, .step-editor-card, .dependency-card, .review-summary, .comment-card, .impact-card, .safety-card, .gate-card, .version-panel, .diff-panel, .freeze-rules { padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
+.process-meta-card, .step-editor-card, .dependency-card, .review-summary, .comment-card, .impact-card, .safety-card, .gate-card, .version-panel, .diff-panel, .freeze-rules, .trail-card { padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
 .card-title { margin-bottom: 16px; }
 .meta-grid, .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .form-grid.two-column { grid-template-columns: 1fr 1fr; }
@@ -83,6 +83,7 @@ button, input, textarea, select { font: inherit; }
 .impact-card .bp6-callout { margin-bottom: 10px; }
 .impact-card .bp6-callout strong { display: block; font-size: 11px; }
 .impact-card .bp6-callout p { margin: 4px 0 0; font-size: 10px; }
+.impact-card .bp6-callout .rereview-note { margin-top: 7px; padding-top: 7px; border-top: 1px dashed rgba(95,107,124,.35); color: #8a5410; font-weight: 600; }
 .impact-list { display: grid; }
 .impact-list button { padding: 10px 3px; display: grid; grid-template-columns: 18px 1fr 14px; gap: 6px; align-items: center; border: 0; border-bottom: 1px solid #e7ebf0; text-align: left; background: transparent; cursor: pointer; }
 .impact-list strong, .impact-list small { display: block; }
@@ -109,6 +110,16 @@ button, input, textarea, select { font: inherit; }
 .review-section h4 { margin: 0 0 5px; color: #465365; font-size: 11px; }
 .review-section p { margin: 0; font-size: 12px; line-height: 1.7; }
 .review-summary .bp6-callout { margin-top: 12px; }
+.confirmation-line { display: flex; align-items: center; gap: 7px; margin-top: 12px; padding: 9px 11px; border: 1px solid #dfe5ec; border-radius: 8px; background: #f6f9f7; font-size: 10px; color: #4d5968; }
+.block-hint { margin: -2px 0 8px; font-size: 10px; line-height: 1.5; }
+.trail-card .card-title { margin-bottom: 10px; }
+.trail-heading { margin: 12px 0 7px; color: #465365; font-size: 11px; }
+.trail-list { display: grid; max-height: 190px; overflow-y: auto; }
+.trail-item { padding: 8px 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid #e7ebf0; }
+.trail-item > div { min-width: 0; display: grid; gap: 2px; }
+.trail-item strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.trail-item small { color: #7c8796; font-size: 9px; line-height: 1.5; }
+.trail-item.rereview strong::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--amber); vertical-align: 1px; }
 .comment-compose { display: grid; grid-template-columns: 1fr auto; gap: 9px; align-items: start; margin-bottom: 15px; }
 .comment-list { display: grid; gap: 9px; }
 .comment-list article { display: flex; gap: 10px; padding: 12px; border: 1px solid #e2e7ed; border-radius: 8px; background: #f9fafb; }

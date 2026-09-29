@@ -57,6 +57,26 @@ interface VersionSnapshot {
   steps: ProcessStep[];
 }
 
+interface ConfirmationRecord {
+  id: string;
+  stepId: string;
+  stepTitle: string;
+  confirmedBy: string;
+  confirmedAt: string;
+  fingerprint: string;
+  origin: 'recorded' | 'unknown';
+}
+
+interface ReReviewRecord {
+  id: string;
+  triggerStepId: string;
+  triggerStepTitle: string;
+  changedFields: string[];
+  affectedStepIds: string[];
+  affectedStepTitles: string[];
+  createdAt: string;
+}
+
 interface ExperimentProcess {
   id: string;
   title: string;
@@ -68,6 +88,8 @@ interface ExperimentProcess {
   version: string;
   steps: ProcessStep[];
   versions: VersionSnapshot[];
+  confirmations: ConfirmationRecord[];
+  reReviews: ReReviewRecord[];
   frozenAt?: string;
   updatedAt: string;
 }
@@ -94,7 +116,25 @@ function uid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function initialProcess(): ExperimentProcess {
+const CONDITION_FIELDS: { key: keyof ProcessStep; label: string }[] = [
+  { key: 'title', label: '名称' },
+  { key: 'purpose', label: '目的' },
+  { key: 'materials', label: '材料' },
+  { key: 'equipment', label: '设备' },
+  { key: 'amount', label: '用量' },
+  { key: 'duration', label: '预计时间' },
+  { key: 'hazards', label: '危险项' },
+  { key: 'controls', label: '控制措施' },
+  { key: 'safetyNote', label: '安全说明' },
+  { key: 'expectedResult', label: '预期结果' },
+  { key: 'dependencies', label: '依赖关系' }
+];
+
+export function stepFingerprint(step: ProcessStep): string {
+  return JSON.stringify(CONDITION_FIELDS.map(({ key }) => step[key]));
+}
+
+export function initialProcess(): ExperimentProcess {
   const baseSteps: ProcessStep[] = [
     {
       id: 'step-1', title: '核对试剂与实验区域', purpose: '确认所需物料、设备及区域状态符合实验方案。',
@@ -155,16 +195,26 @@ function initialProcess(): ExperimentProcess {
     steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
   };
 
+  const seedConfirmations: ConfirmationRecord[] = baseSteps
+    .filter((step) => step.status === 'confirmed')
+    .map((step) => ({
+      id: `confirmation-${step.id}`, stepId: step.id, stepTitle: step.title,
+      confirmedBy: step.id === 'step-1' ? '李明' : '王颖',
+      confirmedAt: step.id === 'step-1' ? '2026-09-24T09:15:00+08:00' : '2026-09-24T10:20:00+08:00',
+      fingerprint: stepFingerprint(step), origin: 'recorded'
+    }));
+
   return {
     id: 'exp-catalyst-2026-09', title: '负载型催化剂评价实验', code: 'SAFE-CAT-026',
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, versions: [firstVersion, secondVersion],
+    confirmations: seedConfirmations, reReviews: [], updatedAt: new Date().toISOString()
   };
 }
 
-function historyReducer(state: HistoryState, action:
+export function historyReducer(state: HistoryState, action:
   | { type: 'commit'; update: (draft: ExperimentProcess) => void }
   | { type: 'undo' }
   | { type: 'redo' }
@@ -194,10 +244,37 @@ function loadProcess(): ExperimentProcess {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
     const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    return parsed.id && Array.isArray(parsed.steps) ? migrateProcess(parsed) : initialProcess();
   } catch {
     return initialProcess();
   }
+}
+
+export function migrateProcess(process: ExperimentProcess): ExperimentProcess {
+  const hasConfirmationLog = Array.isArray(process.confirmations);
+  const migrated: ExperimentProcess = {
+    ...process,
+    confirmations: hasConfirmationLog ? process.confirmations : [],
+    reReviews: Array.isArray(process.reReviews) ? process.reReviews : []
+  };
+  migrated.steps = migrated.steps.map((step) => ({
+    ...step,
+    dependencies: Array.isArray(step.dependencies) ? step.dependencies : [],
+    comments: Array.isArray(step.comments) ? step.comments : []
+  }));
+  if (!hasConfirmationLog) {
+    // 旧数据缺少确认记录：已有确认按来源不明处理
+    migrated.steps.forEach((step) => {
+      if (step.status === 'confirmed') {
+        migrated.confirmations.push({
+          id: uid('confirmation'), stepId: step.id, stepTitle: step.title,
+          confirmedBy: '未知', confirmedAt: process.updatedAt ?? new Date().toISOString(),
+          fingerprint: '', origin: 'unknown'
+        });
+      }
+    });
+  }
+  return migrated;
 }
 
 function splitList(value: string): string[] {
@@ -235,11 +312,35 @@ function App() {
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
   const downstreamIds = useMemo(() => collectDownstream(process.steps, lastModifiedId), [process.steps, lastModifiedId]);
   const impactedSteps = process.steps.filter((step) => downstreamIds.includes(step.id));
+  const lastReReview = useMemo(
+    () => [...process.reReviews].reverse().find((record) => record.triggerStepId === lastModifiedId) ?? null,
+    [process.reReviews, lastModifiedId]
+  );
+  const demotedIds = useMemo(() => new Set(lastReReview?.affectedStepIds ?? []), [lastReReview]);
   const missingSafetySteps = process.steps.filter(hasMissingSafety);
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+  const selectedConfirmation = selectedStep ? process.confirmations.find((record) => record.stepId === selectedStep.id) ?? null : null;
+  const selectedConfirmationValid = Boolean(
+    selectedStep && selectedConfirmation?.origin === 'recorded' && selectedConfirmation.fingerprint === stepFingerprint(selectedStep)
+  );
+  const openCommentCount = selectedStep ? selectedStep.comments.filter((comment) => !comment.resolved).length : 0;
+  const confirmBlocked = !selectedStep || hasMissingSafety(selectedStep) || openCommentCount > 0;
+  const confirmationViews = process.steps
+    .filter((step) => step.status === 'confirmed')
+    .map((step) => {
+      const record = process.confirmations.find((item) => item.stepId === step.id) ?? null;
+      return {
+        step,
+        record,
+        unknown: !record || record.origin === 'unknown',
+        valid: Boolean(record && record.origin === 'recorded' && record.fingerprint === stepFingerprint(step))
+      };
+    });
+  const unknownOriginCount = confirmationViews.filter((view) => view.unknown).length;
+  const reReviewList = useMemo(() => [...process.reReviews].reverse(), [process.reReviews]);
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
@@ -291,11 +392,15 @@ function App() {
 
   const updateStep = (field: keyof ProcessStep, value: unknown): void => {
     if (!selectedStep) return;
+    if (JSON.stringify(selectedStep[field]) === JSON.stringify(value)) return;
     const id = selectedStep.id;
     setLastModifiedId(id);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      const conditionField = CONDITION_FIELDS.find((item) => item.key === field);
+      if (conditionField) invalidateConfirmedSteps(draft, id, [conditionField.label]);
     });
   };
 
@@ -338,8 +443,12 @@ function App() {
     if (!selectedStep || process.steps.length <= 1 || process.status === 'frozen') return;
     const id = selectedStep.id;
     commitProcess((draft) => {
+      const triggerTitle = draft.steps.find((step) => step.id === id)?.title ?? '未知步骤';
+      const downstreamIds = collectDownstream(draft.steps, id);
       draft.steps = draft.steps.filter((step) => step.id !== id);
       draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
+      demoteConfirmedSteps(draft, id, `${triggerTitle}（已删除）`, ['依赖关系'], downstreamIds);
+      draft.confirmations = draft.confirmations.filter((record) => record.stepId !== id);
     });
     setSelectedStepId(process.steps.find((step) => step.id !== id)?.id ?? '');
   };
@@ -392,8 +501,22 @@ function App() {
 
   const setStepStatus = (status: StepStatus): void => {
     if (!selectedStep) return;
-    updateStep('status', status);
-    setLastModifiedId(status === 'returned' ? selectedStep.id : null);
+    if (status === 'confirmed' && (hasMissingSafety(selectedStep) || hasOpenComments(selectedStep))) return;
+    const id = selectedStep.id;
+    commitProcess((draft) => {
+      const step = draft.steps.find((item) => item.id === id);
+      if (!step) return;
+      step.status = status;
+      draft.confirmations = draft.confirmations.filter((record) => record.stepId !== id);
+      if (status === 'confirmed') {
+        draft.confirmations.push({
+          id: uid('confirmation'), stepId: id, stepTitle: step.title,
+          confirmedBy: CURRENT_AUTHOR, confirmedAt: new Date().toISOString(),
+          fingerprint: stepFingerprint(step), origin: 'recorded'
+        });
+      }
+    });
+    setLastModifiedId(status === 'returned' ? id : null);
   };
 
   const resolveComment = (commentId: string): void => {
@@ -440,6 +563,7 @@ function App() {
         step.status = 'draft';
         step.comments = [];
       });
+      draft.confirmations = [];
     });
     setActiveView('editor');
     setSavedLabel('已从冻结版本创建修订稿');
@@ -580,18 +704,21 @@ function App() {
                   <Callout intent={impactedSteps.length ? 'warning' : 'primary'} icon={impactedSteps.length ? 'warning-sign' : 'tick'}>
                     <strong>{impactedSteps.length ? `${impactedSteps.length} 个后续步骤受影响` : '未发现下游步骤'}</strong>
                     <p>{impactedSteps.length ? '请重新核对依赖、用量、危险项和已确认内容。' : '当前修改没有影响其他步骤的安全条件。'}</p>
+                    {lastReReview && (
+                      <p className="rereview-note">变化字段：{lastReReview.changedFields.join('、')} · {lastReReview.affectedStepIds.length} 个已确认步骤已回到待复核（{formatDate(lastReReview.createdAt)}），需重新确认后才能冻结。</p>
+                    )}
                   </Callout>
                   <div className="impact-list">
                     {impactedSteps.map((step) => (
                       <button key={step.id} onClick={() => setSelectedStepId(step.id)}>
                         <Icon icon={step.status === 'confirmed' ? 'endorsed' : 'circle'} intent={step.status === 'confirmed' ? 'success' : 'none'} size={13} />
-                        <span><strong>{step.title}</strong><small>{step.status === 'confirmed' ? '已确认内容，需重新复核' : `当前状态：${statusLabel(step.status)}`}</small></span>
+                        <span><strong>{step.title}</strong><small>{demotedIds.has(step.id) ? '已确认内容已回到待复核，需重新确认' : step.status === 'confirmed' ? '已确认内容，需重新复核' : `当前状态：${statusLabel(step.status)}`}</small></span>
                         <Icon icon="chevron-right" size={12} />
                       </button>
                     ))}
                   </div>
                 </>
-              ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤和已确认内容。</p>}
+              ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤；受影响的已确认步骤会自动回到待复核并留下记录。</p>}
             </Card>
 
             <Card elevation={Elevation.ONE} className="safety-card">
@@ -635,6 +762,14 @@ function App() {
                   </div>
                   <div className="review-section"><h4>控制措施</h4><p>{selectedStep.controls || '未填写'}</p></div>
                   <div className="review-section"><h4>安全说明</h4><p className={hasMissingSafety(selectedStep) ? 'danger-text' : ''}>{selectedStep.safetyNote || '未填写'}</p></div>
+                  {selectedStep.status === 'confirmed' && (
+                    <div className="confirmation-line">
+                      <Icon icon="endorsed" size={13} intent={selectedConfirmation?.origin === 'recorded' ? 'success' : 'warning'} />
+                      {selectedConfirmation && selectedConfirmation.origin === 'recorded'
+                        ? <span>由 {selectedConfirmation.confirmedBy} 确认于 {formatDate(selectedConfirmation.confirmedAt)} · {selectedConfirmationValid ? '记录与当前内容一致，确认仍有效' : '内容已变化，确认记录失效'}</span>
+                        : <span>确认来源不明：旧数据缺少确认记录，无法核验确认内容。</span>}
+                    </div>
+                  )}
                   {hasMissingSafety(selectedStep) && <Callout intent="danger" icon="warning-sign">当前步骤存在安全信息缺口，不能确认或冻结版本。</Callout>}
                 </Card>
                 <Card elevation={Elevation.ONE} className="comment-card">
@@ -659,8 +794,10 @@ function App() {
           <aside className="review-actions">
             <Card elevation={Elevation.ONE}>
               <div className="card-title"><div><span>REVIEWER ACTION</span><h3>复核决定</h3></div><Icon icon="endorsed" size={18} /></div>
-              <p className="muted">确认后若修改该步骤，受影响的下游步骤会在编辑页重新提示。</p>
-              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep)} onClick={() => setStepStatus('confirmed')} />
+              <p className="muted">确认后若该步骤或上游步骤的条件、依赖发生变化，相关确认会自动回到待复核并留下记录。</p>
+              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={confirmBlocked} onClick={() => setStepStatus('confirmed')} />
+              {openCommentCount > 0 && <p className="block-hint danger-text">有 {openCommentCount} 条未解决批注，解决后还需重新确认才能冻结。</p>}
+              {openCommentCount === 0 && selectedStep && hasMissingSafety(selectedStep) && <p className="block-hint danger-text">安全信息不完整，补齐控制措施和安全说明后才能确认。</p>}
               <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
               <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
               <Divider />
@@ -668,6 +805,37 @@ function App() {
                 {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
               </div>
               <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
+            </Card>
+            <Card elevation={Elevation.ONE} className="trail-card">
+              <div className="card-title"><div><span>REVIEW TRAIL</span><h3>复核追溯</h3></div><Icon icon="history" size={18} /></div>
+              <h4 className="trail-heading">确认记录</h4>
+              {confirmationViews.length ? (
+                <div className="trail-list">
+                  {confirmationViews.map((view) => (
+                    <div key={view.step.id} className="trail-item">
+                      <div>
+                        <strong>{view.step.title}</strong>
+                        <small>{view.record && !view.unknown ? `${view.record.confirmedBy} · ${formatDate(view.record.confirmedAt)}` : '旧数据缺少确认记录'}</small>
+                      </div>
+                      <Tag minimal intent={view.unknown ? 'warning' : view.valid ? 'success' : 'danger'}>{view.unknown ? '来源不明' : view.valid ? '确认有效' : '已失效'}</Tag>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="muted">暂无已确认步骤。</p>}
+              <h4 className="trail-heading">重新复核记录</h4>
+              {reReviewList.length ? (
+                <div className="trail-list">
+                  {reReviewList.map((record) => (
+                    <div key={record.id} className="trail-item rereview">
+                      <div>
+                        <strong>{record.triggerStepTitle}</strong>
+                        <small>{formatDate(record.createdAt)} · 变化字段：{record.changedFields.join('、')}</small>
+                        <small>波及 {record.affectedStepIds.length} 步：{record.affectedStepTitles.join('、')}</small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="muted">暂无重新复核记录。</p>}
             </Card>
           </aside>
         </main>
@@ -702,6 +870,7 @@ function App() {
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
+            <div className={!unknownOriginCount ? 'passed' : ''}><Icon icon={!unknownOriginCount ? 'tick-circle' : 'warning-sign'} /><span><strong>确认记录可追溯</strong><small>{unknownOriginCount ? `${unknownOriginCount} 条确认来源不明（旧数据）` : '全部确认均有记录'}</small></span></div>
             <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
           </Card>
         </main>
@@ -719,7 +888,11 @@ function hasMissingSafety(step: ProcessStep): boolean {
   return step.hazards.length > 0 && (!step.controls.trim() || !step.safetyNote.trim());
 }
 
-function collectDownstream(steps: ProcessStep[], sourceId: string | null): string[] {
+function hasOpenComments(step: ProcessStep): boolean {
+  return step.comments.some((comment) => !comment.resolved);
+}
+
+export function collectDownstream(steps: ProcessStep[], sourceId: string | null): string[] {
   if (!sourceId) return [];
   const result = new Set<string>();
   const visit = (id: string) => {
@@ -731,6 +904,44 @@ function collectDownstream(steps: ProcessStep[], sourceId: string | null): strin
   };
   visit(sourceId);
   return [...result];
+}
+
+export function demoteConfirmedSteps(
+  draft: ExperimentProcess,
+  triggerStepId: string,
+  triggerStepTitle: string,
+  changedFields: string[],
+  candidateIds: string[]
+): void {
+  const affectedIds = candidateIds.filter((stepId) =>
+    draft.steps.some((step) => step.id === stepId && step.status === 'confirmed')
+  );
+  if (!affectedIds.length) return;
+  draft.steps.forEach((step) => {
+    if (affectedIds.includes(step.id)) step.status = 'submitted';
+  });
+  draft.confirmations = draft.confirmations.filter((record) => !affectedIds.includes(record.stepId));
+  draft.reReviews.push({
+    id: uid('rereview'),
+    triggerStepId,
+    triggerStepTitle,
+    changedFields,
+    affectedStepIds: affectedIds,
+    affectedStepTitles: affectedIds.map((stepId) => draft.steps.find((step) => step.id === stepId)?.title ?? '未知步骤'),
+    createdAt: new Date().toISOString()
+  });
+  draft.reReviews = draft.reReviews.slice(-50);
+}
+
+export function invalidateConfirmedSteps(draft: ExperimentProcess, triggerStepId: string, changedFields: string[]): void {
+  const trigger = draft.steps.find((step) => step.id === triggerStepId);
+  demoteConfirmedSteps(
+    draft,
+    triggerStepId,
+    trigger?.title ?? '未知步骤',
+    changedFields,
+    [triggerStepId, ...collectDownstream(draft.steps, triggerStepId)]
+  );
 }
 
 function nextMinorVersion(value: string): string {
